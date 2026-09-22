@@ -25,6 +25,7 @@
     "softener_concentration",
     "softener_low",
     "softener_quantity",
+    "soil_level",
     "spin_speed",
     "wash_temperature"
   ]

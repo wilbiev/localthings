@@ -15,12 +15,13 @@ here; they read washer-only fields off the same shared /course/vs/0 options
 array.
 """
 
+from typing import Any
+
+from ...helpers.washer_matrix import is_supported_for_current_course, parse_supported_options_matrix
 from ..capability import Capability
 from ..entities import BinarySensorDesc, SelectDesc, SensorDesc, SwitchDesc
 from .laundry import (
     bool_option_exists,
-    bool_option_switch,
-    cycle_options,
     cycle_select,
     drum_clean_cycles_remaining,
     drum_clean_last_cleaned,
@@ -88,15 +89,81 @@ def _enabled_write(field):
     return write
 
 
+def _get_dynamic_course_options(resources: dict[str, Any], option_type: str) -> list[str]:
+    # Extract and decode course-specific options for the active washer cycle.
+
+    # Reads the 20-character bitmask array in `x.com.samsung.da.supportedOptions` from
+    # `/course/vs/0` and maps it against the global supported option master lists in
+    # `/washer/vs/0` (`supportedSoilLevel`, `supportedWaterTemperature`, etc.).
+
+    # Returns a filtered list of valid options (`soil`, `temp`, `spin`, `rinse`, `dry`)
+    # allowed for the currently selected `currentCourse`, automatically removing 'None'
+    # placeholders.
+
+    course_res = resources.get("/course/vs/0") or {}
+    raw_supported = course_res.get("x.com.samsung.da.supportedOptions") or []
+    opts = course_res.get("x.com.samsung.da.options") or []
+
+    raw_course = option_value(opts, "Course") or ""
+    current_course_hex = raw_course.replace("Course_", "").strip().upper()
+
+    if not raw_supported or not current_course_hex:
+        return []
+
+    # Handle supportedOptions whether string or 1-element list
+    if isinstance(raw_supported, list) and len(raw_supported) == 1:
+        raw_supported = raw_supported[0]
+
+    global_lists = {
+        "supportedSoilLevel": (resources.get("/washer/vs/0") or {}).get("x.com.samsung.da.supportedSoilLevel", []),
+        "supportedWaterTemperature": (resources.get("/washer/vs/0") or {}).get("x.com.samsung.da.supportedWaterTemperature", []),
+        "supportedSpinLevel": (resources.get("/washer/vs/0") or {}).get("x.com.samsung.da.supportedSpinLevel", []),
+        "supportedRinseCycles": (resources.get("/washer/vs/0") or {}).get("x.com.samsung.da.supportedRinseCycles", []),
+        "supportedDryLevel": (resources.get("/washer/vs/0") or {}).get("x.com.samsung.da.supportedDryLevel", []),
+    }
+
+    # Extract Table_02 context metadata
+    washercourse_res = resources.get("/st/washercourse/vs/0") or {}
+    course_table = washercourse_res.get("x.com.samsung.da.st.courseTable")
+
+    editcourse_res = resources.get("/wm/editcourse/vs/0") or {}
+    edit_course_list = editcourse_res.get("x.com.samsung.da.editCourseList")
+
+    matrix = parse_supported_options_matrix(
+        raw_supported,
+        global_lists=global_lists,
+        course_table=course_table,
+        edit_course_list=edit_course_list,
+    )
+
+    if current_course_hex in matrix:
+        return matrix[current_course_hex].get(option_type, [])
+    return []
+
+
 WASHER_SETTINGS = Capability(
     href="/washer/vs/0",
     entities=(
+        SelectDesc(
+            key="soil_level",
+            field="x.com.samsung.da.soilLevel",
+            icon="mdi:gauge",
+            entity_category="config",
+            options_field="x.com.samsung.da.supportedSoilLevel",
+            options=lambda resources: _get_dynamic_course_options(resources, "soil"),
+            exists_fn=lambda rep, resources: bool(rep.get("x.com.samsung.da.supportedSoilLevel")),
+            write_fn=lambda p, rep, href=None: (
+                ["washer", "vs", "0"],
+                {"x.com.samsung.da.soilLevel": p},
+            ),
+        ),
         SelectDesc(
             key="wash_temperature",
             field="x.com.samsung.da.waterTemperature",
             icon="mdi:thermometer-water",
             entity_category="config",
             options_field="x.com.samsung.da.supportedWaterTemperature",
+            options=lambda resources: _get_dynamic_course_options(resources, "temp"),
             write_fn=lambda p, rep, href=None: (
                 ["washer", "vs", "0"],
                 {"x.com.samsung.da.waterTemperature": p},
@@ -108,6 +175,7 @@ WASHER_SETTINGS = Capability(
             icon="mdi:sync",
             entity_category="config",
             options_field="x.com.samsung.da.supportedSpinLevel",
+            options=lambda resources: _get_dynamic_course_options(resources, "spin"),
             write_fn=lambda p, rep, href=None: (
                 ["washer", "vs", "0"],
                 {"x.com.samsung.da.spinLevel": p},
@@ -119,6 +187,7 @@ WASHER_SETTINGS = Capability(
             icon="mdi:water-sync",
             entity_category="config",
             options_field="x.com.samsung.da.supportedRinseCycles",
+            options=lambda resources: _get_dynamic_course_options(resources, "rinse"),
             write_fn=lambda p, rep, href=None: (
                 ["washer", "vs", "0"],
                 {"x.com.samsung.da.rinseCycles": p},
@@ -156,6 +225,7 @@ WASHER_SETTINGS = Capability(
             entity_category="config",
             translation_key="washer_dry_level",
             options_field="x.com.samsung.da.supportedDryLevel",
+            options=lambda resources: _get_dynamic_course_options(resources, "dry"),
             exists_fn=lambda rep, resources: bool(rep.get("x.com.samsung.da.supportedDryLevel")),
             write_fn=lambda p, rep, href=None: (
                 ["washer", "vs", "0"],
@@ -267,32 +337,43 @@ def _dosing_low(prefix):
 # presence machinery is laundry.bool_option_switch, shared with
 # dishwasher's storm-wash/auto-release-dry toggles; only this per-course
 # gating is washer-only.
-def _bool_option_switch(key, icon, prefix, availability_field):
+def _bool_option_switch(key, icon, prefix, availability_field=None):
     def validate(p, rep, resources):
-        """Reject turning on when the selected course's byte in
-        `availability_field` isn't 'F0'. Turning off is never blocked.
-        Falls back to allowing the write whenever the availability data
-        can't be resolved (unrecognized course, missing/mismatched-length
-        bitmap) -- a false rejection is worse than an occasional no-op."""
         if p != "On":
             return None
-        opts = rep.get("x.com.samsung.da.options") or []
-        current = option_value(opts, "Course")
-        courses = cycle_options(resources)
-        if not current or current not in courses:
-            return None
-        raw = option_value(opts, availability_field)
-        if raw is None:
-            return None
-        pairs = hex_pairs(raw)
-        if len(pairs) != len(courses):
-            return None
-        if pairs[courses.index(current)] != "F0":
+        if not is_supported_for_current_course(
+            rep, resources, key=key, availability_field=availability_field
+        ):
             return f"{key}_unavailable_for_cycle"
         return None
 
-    return bool_option_switch(
-        key, icon, prefix, entity_category="config", gate_on_presence=True, validate_fn=validate
+    def extra_attributes(rep, resources):
+        return {
+            "course_supported": is_supported_for_current_course(
+                rep, resources, key=key, availability_field=availability_field
+            )
+        }
+
+    def rep_fn(rep):
+        raw = option_value(rep.get("x.com.samsung.da.options"), prefix)
+        return raw.lower() == "on" if isinstance(raw, str) else None
+
+    def write_fn(p, rep, href=None):
+        if p not in ("On", "Off"):
+            return None
+        return ["course", "vs", "0"], {
+            "x.com.samsung.da.options": option_write(prefix, p)
+        }
+
+    return SwitchDesc(
+        key=key,
+        icon=icon,
+        entity_category="config",
+        exists_fn=bool_option_exists(prefix),
+        rep_fn=rep_fn,
+        write_fn=write_fn,
+        validate_fn=validate,
+        extra_state_attributes_fn=extra_attributes,
     )
 
 
@@ -474,13 +555,9 @@ WASHER_COURSE = Capability(
             exists_fn=bool_option_exists("SoftenerAlarm"),
             rep_fn=_dosing_low("SoftenerAlarm"),
         ),
-        _bool_option_switch("bubble_soak", "mdi:chart-bubble", "BubbleSoak", "BubbleSoakSet"),
-        _bool_option_switch(
-            "pre_wash", "mdi:washing-machine", "PreWashSetting", "PreWashAvailableSet"
-        ),
-        _bool_option_switch(
-            "intensive", "mdi:washing-machine", "IntensiveSetting", "IntensiveAvailableSet"
-        ),
+        _bool_option_switch("bubble_soak", "mdi:chart-bubble", "BubbleSoak", availability_field="BubbleSoakSet"),
+        _bool_option_switch("pre_wash", "mdi:washing-machine", "PreWashSetting", availability_field="PreWashAvailableSet"),
+        _bool_option_switch("intensive", "mdi:creation", "IntensiveSetting", availability_field="IntensiveAvailableSet"),
         SwitchDesc(
             key="add_wash_alarm",
             icon="mdi:bell-ring",
